@@ -33,7 +33,7 @@ function createSession(atvSocketId) {
   const s = {
     atvSocketId,
     createdAt: Date.now(),
-    players: [], // phones only: {id,name,isManager,score}
+    players: [], // phones only
     settings: { rounds: 3, minLen: 3, maxLen: 24 },
     game: null
   };
@@ -67,8 +67,7 @@ function startNextRound(session) {
     return;
   }
 
-  // rotate setter among PHONE players (exclude ATV)
-  const phonePlayers = session.players; // ATV is never in players now
+  const phonePlayers = session.players;
   if (phonePlayers.length === 0) {
     session.game.state = "idle";
     session.game.round = null;
@@ -109,6 +108,18 @@ function buildMasked(raw, guessedSet) {
   return out;
 }
 
+function currentTurnPlayerId(session) {
+  const r = session.game?.round; if (!r) return null;
+  if (!r.guesserOrder || r.guesserOrder.length === 0) return null;
+  return r.guesserOrder[r.turnIndex % r.guesserOrder.length];
+}
+
+function advanceTurn(session) {
+  const r = session.game.round;
+  if (!r.guesserOrder || r.guesserOrder.length === 0) return;
+  r.turnIndex = (r.turnIndex + 1) % r.guesserOrder.length;
+}
+
 function emitSessionPlayers(code) {
   const s = sessions.get(code); if (!s) return;
   io.to(code).emit("session:players", {
@@ -120,29 +131,19 @@ function emitSessionPlayers(code) {
 function emitGameState(code) {
   const s = sessions.get(code); if (!s) return;
   const g = s.game;
+  const currentTurnId = s.game && s.game.state === "active" ? currentTurnPlayerId(s) : null;
   io.to(code).emit("game:state", {
     state: g?.state ?? "idle",
     roundsTotal: s.settings.rounds,
     roundIndex: g?.roundIndex ?? -1,
     setterId: g?.round?.setterId ?? null,
+    currentTurnId, // <<< NEW
     hintShown: g?.round?.hintShown ?? false,
     masked: g?.round?.masked ?? "",
     guessedLetters: g?.round?.guessedLetters ?? [],
     winnerId: g?.round?.winnerId ?? null,
     scores: s.players.map(p => ({ id: p.id, score: p.score ?? 0 }))
   });
-}
-
-function currentTurnPlayerId(session) {
-  const r = session.game?.round; if (!r) return null;
-  if (!r.guesserOrder || r.guesserOrder.length === 0) return null;
-  return r.guesserOrder[r.turnIndex % r.guesserOrder.length];
-}
-
-function advanceTurn(session) {
-  const r = session.game.round;
-  if (!r.guesserOrder || r.guesserOrder.length === 0) return;
-  r.turnIndex = (r.turnIndex + 1) % r.guesserOrder.length;
 }
 
 /** -------------------------
@@ -166,7 +167,8 @@ app.get("/debug/sessions", (_req, res) => {
           masked: s.game.round.masked,
           guessedLetters: s.game.round.guessedLetters,
           hintShown: s.game.round.hintShown,
-          winnerId: s.game.round.winnerId
+          winnerId: s.game.round.winnerId,
+          currentTurnId: currentTurnPlayerId(s)
         } : null
       } : null
     });
@@ -174,29 +176,22 @@ app.get("/debug/sessions", (_req, res) => {
   res.json(out);
 });
 
-// HTTP reset all sessions
+// HTTP reset/create/join (same as before, useful for quick checks)
 app.get("/debug/reset", (_req, res) => { sessions.clear(); res.json({ ok: true }); });
-
-// HTTP create (simulate ATV)
 app.get("/debug/create", (_req, res) => {
   const fakeAtvId = "HTTP_DEBUG_ATV_" + Math.random().toString(36).slice(2, 8);
   const code = createSession(fakeAtvId);
   res.json({ code });
 });
-
-// HTTP join (simulate phone)
 app.get("/debug/join", (req, res) => {
   let { code = "", name = "Player" } = req.query;
   code = String(code).trim().toUpperCase();
   name = String(name).slice(0, 16);
-
   const s = getSession(code);
   if (!s) return res.status(400).json({ error: "Invalid or expired code." });
-
-  const isManager = s.players.length === 0; // first phone is manager
+  const isManager = s.players.length === 0;
   const fakeSocketId = "HTTP_" + Math.random().toString(36).slice(2, 8);
   s.players.push({ id: fakeSocketId, name, isManager, score: 0 });
-
   emitSessionPlayers(code);
   emitGameState(code);
   res.json({ ok: true, code, name, isManager });
@@ -208,12 +203,10 @@ app.get("/debug/join", (req, res) => {
 io.on("connection", (socket) => {
   socket.data.code = null;
 
-  // Log every event & payload for visibility
   socket.onAny((event, payload) => {
     console.log(`📨 ${socket.id} -> ${event}`, payload || "");
   });
 
-  // ATV creates session (ATV is NOT a player)
   socket.on("atv:createSession", () => {
     const code = createSession(socket.id);
     socket.join(code);
@@ -223,85 +216,67 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
-  // ATV: fetch current lists after reconnect
   socket.on("atv:getPlayers", ({ code }) => {
     if (!getSession(code)) { socket.emit("session:ended"); return; }
     emitSessionPlayers(code);
     emitGameState(code);
   });
 
-  // Phone join (first phone becomes manager)
   socket.on("player:join", ({ code, name }) => {
     code = String(code || "").trim().toUpperCase();
     const s = getSession(code);
     if (!s) { socket.emit("error:join", { message: "Invalid or expired code." }); return; }
-
     const safeName = String(name || "Player").slice(0, 16);
     const isManager = s.players.length === 0;
-
     s.players.push({ id: socket.id, name: safeName, isManager, score: 0 });
     socket.join(code);
     socket.data.code = code;
-
     socket.emit("player:joined", { code, isManager });
     emitSessionPlayers(code);
     emitGameState(code);
   });
 
-  // Manager: settings & start
   socket.on("manager:setSettings", ({ rounds, minLen, maxLen }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s) return;
     const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
-
     if (Number.isInteger(rounds) && rounds >= 1 && rounds <= 20) s.settings.rounds = rounds;
     if (Number.isInteger(minLen) && minLen >= 1 && minLen <= 40) s.settings.minLen = minLen;
     if (Number.isInteger(maxLen) && maxLen >= s.settings.minLen && maxLen <= 60) s.settings.maxLen = maxLen;
-
     emitGameState(code);
   });
 
   socket.on("manager:startGame", () => {
     const code = socket.data.code; const s = sessions.get(code); if (!s) return;
     const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
-
     if (!s.game) s.game = newGame();
     startNextRound(s);
     emitSessionPlayers(code);
     emitGameState(code);
   });
 
-  // Setter submits phrase + hint
   socket.on("setter:submitPhrase", ({ phrase, hint }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "waiting_phrase") return;
     const r = s.game.round;
     if (socket.id !== r.setterId) return;
-
     const norm = normalizePhrase(phrase);
     if (!norm) { socket.emit("error:phrase", { message: "Invalid characters. Use letters, space, ', -, ." }); return; }
-
     const onlyLetters = norm.replace(/[^A-Z]/g, "");
     if (onlyLetters.length < s.settings.minLen || onlyLetters.length > s.settings.maxLen) {
       socket.emit("error:phrase", { message: `Length must be ${s.settings.minLen}-${s.settings.maxLen} letters.` });
       return;
     }
-
     r.raw = norm;
     r.hint = String(hint || "").slice(0, 100);
     r.guessedLetters = [];
     r.hintShown = false;
-
-    // guessers are all phones except the setter
     r.guesserOrder = s.players.filter(p => p.id !== r.setterId).map(p => p.id);
     r.turnIndex = 0;
-
     r.masked = buildMasked(r.raw, new Set(r.guessedLetters));
     s.game.state = "active";
-
     socket.emit("setter:ok", { ok: true });
     emitGameState(code);
   });
 
-  // Setter shows hint (reduces points to 1)
   socket.on("setter:showHint", () => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
     const r = s.game.round; if (socket.id !== r.setterId) return;
@@ -312,51 +287,41 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Player guesses ONE letter (must be their turn)
   socket.on("player:guessLetter", ({ letter }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
     const r = s.game.round;
     const meId = socket.id;
-    if (meId !== currentTurnPlayerId(s)) return; // not your turn
-
+    if (meId !== currentTurnPlayerId(s)) return;
     const L = String(letter || "").toUpperCase();
     if (!/^[A-Z]$/.test(L)) return;
     if (r.guessedLetters.includes(L)) return;
-
     r.guessedLetters.push(L);
     r.masked = buildMasked(r.raw, new Set(r.guessedLetters));
-
     if (!r.masked.includes("_")) {
       s.game.state = "won";
       r.winnerId = meId;
       const pts = r.hintShown ? 1 : 2;
       const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
-
       emitGameState(code);
       setTimeout(() => { startNextRound(s); emitSessionPlayers(code); emitGameState(code); }, 800);
       return;
     }
-
     advanceTurn(s);
     emitGameState(code);
   });
 
-  // Player attempts full solve (must be their turn)
   socket.on("player:solve", ({ guess }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
     const r = s.game.round;
     const meId = socket.id;
     if (meId !== currentTurnPlayerId(s)) return;
-
     const normGuess = normalizePhrase(guess); if (!normGuess) return;
-
     if (normGuess === r.raw) {
       s.game.state = "won";
       r.winnerId = meId;
       const pts = r.hintShown ? 1 : 2;
       const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
       r.masked = r.raw;
-
       emitGameState(code);
       setTimeout(() => { startNextRound(s); emitSessionPlayers(code); emitGameState(code); }, 800);
     } else {
@@ -365,7 +330,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Disconnect cleanup
   socket.on("disconnect", () => {
     const code = socket.data.code;
     if (!code || !sessions.has(code)) return;
@@ -383,9 +347,7 @@ io.on("connection", (socket) => {
       const removedId = s.players[idx].id;
       s.players.splice(idx, 1);
 
-      if (wasManager && s.players.length > 0) {
-        s.players[0].isManager = true;
-      }
+      if (wasManager && s.players.length > 0) s.players[0].isManager = true;
 
       if (s.game?.round?.guesserOrder) {
         const gidx = s.game.round.guesserOrder.indexOf(removedId);
@@ -403,4 +365,4 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`)); 
