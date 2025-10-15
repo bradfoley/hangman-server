@@ -1,4 +1,4 @@
-// Express + Socket.IO server for Render (sessions + join flow)
+// Express + Socket.IO server for Render (sessions + join flow + robust updates)
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
@@ -9,6 +9,20 @@ app.use(cors());
 app.get("/", (_req, res) =>
   res.send("✅ Hangman server is running (Render) — sessions ready.")
 );
+
+// Quick debug endpoint
+app.get("/debug/sessions", (_req, res) => {
+  const out = [];
+  for (const [code, s] of sessions) {
+    out.push({
+      code,
+      atvSocketId: s.atvSocketId,
+      players: s.players.map(p => ({ id: p.id, name: p.name, isManager: p.isManager })),
+      createdAt: s.createdAt,
+    });
+  }
+  res.json(out);
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -22,8 +36,7 @@ const sessions = new Map(); // code -> { atvSocketId, players:[{id,name,isManage
 const CODE_TTL_MS = 1000 * 60 * 60 * 2; // 2 hours
 
 function makeCode() {
-  // 4 letters + 2 digits (e.g., QJBR27)
-  const letters = "ABCDEFGHJKMNPQRSTUVWXYZ"; // skip ambiguous
+  const letters = "ABCDEFGHJKMNPQRSTUVWXYZ"; // avoid ambiguous
   const digits = "23456789";
   let code = "";
   for (let i = 0; i < 4; i++) code += letters[Math.floor(Math.random() * letters.length)];
@@ -48,59 +61,72 @@ function getSession(code) {
 function emitPlayerList(code) {
   const s = sessions.get(code);
   if (!s) return;
-  io.to(code).emit("session:players", {
+  const payload = {
     code,
     players: s.players.map(p => ({ id: p.id, name: p.name, isManager: p.isManager }))
-  });
+  };
+  // Emit to the room (ATV + all phones)
+  io.to(code).emit("session:players", payload);
+  // Also emit directly to ATV as a backup
+  if (s.atvSocketId) io.to(s.atvSocketId).emit("session:players", payload);
 }
 
 io.on("connection", (socket) => {
   console.log("🔌 connected:", socket.id);
+  socket.data.code = null; // track which room this socket belongs to
 
   /** ATV creates a session */
   socket.on("atv:createSession", () => {
     const code = createSession(socket.id);
-    socket.join(code); // ATV sits in its own room
+    socket.join(code);
+    socket.data.code = code;
     socket.emit("session:created", { code });
     console.log(`📺 ATV created session ${code}`);
   });
 
+  /** ATV requests current player list (e.g. on page reload) */
+  socket.on("atv:getPlayers", ({ code }) => {
+    const s = getSession(code);
+    if (!s) { socket.emit("session:ended"); return; }
+    emitPlayerList(code);
+  });
+
   /** Phone joins a session with name + code */
   socket.on("player:join", ({ code, name }) => {
+    code = String(code || "").trim().toUpperCase();
     const s = getSession(code);
     if (!s) { socket.emit("error:join", { message: "Invalid or expired code." }); return; }
 
-    // First player becomes manager
+    const safeName = String(name || "Player").slice(0, 16);
     const isManager = s.players.length === 0;
-    s.players.push({ id: socket.id, name: String(name || "Player").slice(0, 16), isManager });
 
+    s.players.push({ id: socket.id, name: safeName, isManager });
     socket.join(code);
+    socket.data.code = code;
+
     socket.emit("player:joined", { code, isManager });
     emitPlayerList(code);
 
-    console.log(`👤 ${name} joined ${code} ${isManager ? "(manager)" : ""}`);
+    console.log(`👤 ${safeName} joined ${code} ${isManager ? "(manager)" : ""}`);
   });
 
-  /** Leave / disconnect cleanup */
+  /** Handle disconnects and cleanup */
   socket.on("disconnect", () => {
-    // Remove player from any session and reassign manager if needed
-    for (const [code, s] of sessions.entries()) {
-      const idx = s.players.findIndex(p => p.id === socket.id);
-      if (idx !== -1) {
-        const wasManager = s.players[idx].isManager;
-        s.players.splice(idx, 1);
-
-        // If manager left, pick next player as manager
-        if (wasManager && s.players.length > 0) {
-          s.players[0].isManager = true;
-        }
-
-        // If ATV itself disconnected, trash the session
-        if (s.atvSocketId === socket.id) {
-          sessions.delete(code);
-          io.to(code).emit("session:ended");
-          console.log(`🗑️ session ${code} ended (ATV left)`);
-        } else {
+    const code = socket.data.code;
+    if (code && sessions.has(code)) {
+      const s = sessions.get(code);
+      // If ATV disconnected, end session
+      if (s.atvSocketId === socket.id) {
+        sessions.delete(code);
+        io.to(code).emit("session:ended");
+        console.log(`🗑️ session ${code} ended (ATV left)`);
+      } else {
+        // Remove as a player if present
+        const idx = s.players.findIndex(p => p.id === socket.id);
+        if (idx !== -1) {
+          const wasManager = s.players[idx].isManager;
+          s.players.splice(idx, 1);
+          if (wasManager && s.players.length > 0) s.players[0].isManager = true;
           emitPlayerList(code);
         }
       }
