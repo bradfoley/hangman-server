@@ -137,7 +137,7 @@ function emitGameState(code) {
     roundsTotal: s.settings.rounds,
     roundIndex: g?.roundIndex ?? -1,
     setterId: g?.round?.setterId ?? null,
-    currentTurnId, // <<< NEW
+    currentTurnId,
     hintShown: g?.round?.hintShown ?? false,
     masked: g?.round?.masked ?? "",
     guessedLetters: g?.round?.guessedLetters ?? [],
@@ -150,33 +150,6 @@ function emitGameState(code) {
  * HTTP debug helpers
  * ------------------------- */
 app.get("/", (_req, res) => res.send("✅ Hangman server running — sessions & rounds ready."));
-
-app.get("/debug/sessions", (_req, res) => {
-  const out = [];
-  for (const [code, s] of sessions) {
-    out.push({
-      code,
-      players: s.players.map(p => ({ id: p.id, name: p.name, score: p.score ?? 0, isManager: p.isManager })),
-      settings: s.settings,
-      game: s.game ? {
-        state: s.game.state,
-        roundIndex: s.game.roundIndex,
-        setterIndex: s.game.setterIndex,
-        round: s.game.round ? {
-          setterId: s.game.round.setterId,
-          masked: s.game.round.masked,
-          guessedLetters: s.game.round.guessedLetters,
-          hintShown: s.game.round.hintShown,
-          winnerId: s.game.round.winnerId,
-          currentTurnId: currentTurnPlayerId(s)
-        } : null
-      } : null
-    });
-  }
-  res.json(out);
-});
-
-// HTTP reset/create/join (same as before, useful for quick checks)
 app.get("/debug/reset", (_req, res) => { sessions.clear(); res.json({ ok: true }); });
 app.get("/debug/create", (_req, res) => {
   const fakeAtvId = "HTTP_DEBUG_ATV_" + Math.random().toString(36).slice(2, 8);
@@ -202,7 +175,6 @@ app.get("/debug/join", (req, res) => {
  * ------------------------- */
 io.on("connection", (socket) => {
   socket.data.code = null;
-
   socket.onAny((event, payload) => {
     console.log(`📨 ${socket.id} -> ${event}`, payload || "");
   });
@@ -249,6 +221,17 @@ io.on("connection", (socket) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s) return;
     const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
     if (!s.game) s.game = newGame();
+    startNextRound(s);
+    emitSessionPlayers(code);
+    emitGameState(code);
+  });
+
+  // NEW: manager manually advances after a win
+  socket.on("manager:nextRound", () => {
+    const code = socket.data.code; const s = sessions.get(code); if (!s) return;
+    const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
+    if (!s.game) return;
+    if (s.game.state !== "won") return; // only when a round has been won
     startNextRound(s);
     emitSessionPlayers(code);
     emitGameState(code);
@@ -302,8 +285,8 @@ io.on("connection", (socket) => {
       r.winnerId = meId;
       const pts = r.hintShown ? 1 : 2;
       const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
+      // DO NOT auto-advance; manager will press "Next Puzzle"
       emitGameState(code);
-      setTimeout(() => { startNextRound(s); emitSessionPlayers(code); emitGameState(code); }, 800);
       return;
     }
     advanceTurn(s);
@@ -322,8 +305,8 @@ io.on("connection", (socket) => {
       const pts = r.hintShown ? 1 : 2;
       const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
       r.masked = r.raw;
+      // DO NOT auto-advance; manager will press "Next Puzzle"
       emitGameState(code);
-      setTimeout(() => { startNextRound(s); emitSessionPlayers(code); emitGameState(code); }, 800);
     } else {
       advanceTurn(s);
       emitGameState(code);
@@ -355,7 +338,6 @@ io.on("connection", (socket) => {
         if (s.game.round.guesserOrder.length === 0 && s.game.state === "active") {
           s.game.state = "won";
           s.game.round.winnerId = null;
-          setTimeout(() => { startNextRound(s); emitSessionPlayers(code); emitGameState(code); }, 400);
         }
       }
     }
@@ -365,4 +347,4 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`)); 
+server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
