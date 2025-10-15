@@ -363,7 +363,7 @@ io.on("connection", (socket) => {
         const gidx = s.game.round.guesserOrder.indexOf(removedId);
         if (gidx !== -1) s.game.round.guesserOrder.splice(gidx,1);
         if (s.game.round.guesserOrder.length===0 && s.game.state==="active") {
-          // No guessers left: end round and advance
+          // No guessers left: end round and advance 
           s.game.state = "won";
           s.game.round.winnerId = null;
           setTimeout(()=>{ startNextRound(s); emitSessionPlayers(code); emitGameState(code); }, 400);
