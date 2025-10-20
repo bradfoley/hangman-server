@@ -1,6 +1,6 @@
-// Hangman server — stable baseline
+// Hangman server — stable baseline (full)
 // Features: 4-char codes, players ≤10, ≥2 to start, rounds-as-laps, rename, hint, scoring
-// Minimal Socket.IO config (no special ping tweaks)
+// Settings now LOCK once the game has started (Step 3 change only)
 
 const express = require("express");
 const http = require("http");
@@ -121,6 +121,7 @@ app.get("/debug/create", (_req, res) => {
 io.on("connection", (socket) => {
   socket.data.code = null;
 
+  // ATV creates new session
   socket.on("atv:createSession", () => {
     const code = createSession(socket.id);
     socket.join(code);
@@ -130,18 +131,20 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
+  // ATV reconnects to existing session
   socket.on("atv:getPlayers", ({ code }) => {
     code = String(code || "").trim().toUpperCase();
     const s = getSession(code);
     if (!s) { socket.emit("session:ended"); return; }
     socket.join(code);
     socket.data.code = code;
-    s.atvSocketId = socket.id; // rebind ATV to this socket
-    socket.emit("session:created", { code }); // ensure ATV always sees the code
+    s.atvSocketId = socket.id;            // rebind ATV ownership
+    socket.emit("session:created", { code }); // always re-send code
     emitSessionPlayers(code);
     emitGameState(code);
   });
 
+  // Phone joins
   socket.on("player:join", ({ code, name }) => {
     code = String(code || "").trim().toUpperCase();
     const s = getSession(code);
@@ -159,32 +162,37 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
+  // Rename
   socket.on("player:rename", ({ name }) => {
     const code = socket.data.code;
-    const s = sessions.get(code);
-    if (!s) return;
-    const nn = String(name || "").trim().slice(0, 24);
-    if (!nn) return;
-    const me = s.players.find(p => p.id === socket.id);
-    if (!me) return;
+    const s = sessions.get(code); if (!s) return;
+    const me = s.players.find(p => p.id === socket.id); if (!me) return;
+    const nn = String(name || "").trim().slice(0, 24); if (!nn) return;
     me.name = nn;
     emitSessionPlayers(code);
     emitGameState(code);
   });
 
+  // Manager sets settings
   socket.on("manager:setSettings", ({ rounds, minLen, maxLen }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s) return;
     const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
+
+    // ✅ Step 3: LOCK settings once game is not idle
+    if (s.game && s.game.state && s.game.state !== "idle") {
+      return; // ignore changes after start
+    }
+
     if (Number.isInteger(rounds) && rounds >= 1 && rounds <= 20) s.settings.rounds = rounds;
     if (Number.isInteger(minLen) && minLen >= 1 && minLen <= 40) s.settings.minLen = minLen;
     if (Number.isInteger(maxLen) && maxLen >= s.settings.minLen && maxLen <= 60) s.settings.maxLen = maxLen;
     emitGameState(code);
   });
 
+  // Manager starts game (rounds-as-laps)
   socket.on("manager:startGame", () => {
     const code = socket.data.code; const s = sessions.get(code); if (!s) return;
-    const mgr = s.players.find(p => p.id === socket.id && p.isManager);
-    if (!mgr) return;
+    const mgr = s.players.find(p => p.id === socket.id && p.isManager); if (!mgr) return;
     if (s.players.length < 2) { socket.emit("error:start", { message: "Need at least 2 players to start." }); return; }
 
     s.game = s.game || {};
@@ -200,15 +208,17 @@ io.on("connection", (socket) => {
     startWaitingForPhrase(s);
   });
 
+  // Manager advances after a win
   socket.on("manager:nextRound", () => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game) return;
-    const mgr = s.players.find(p => p.id === socket.id && p.isManager);
-    if (!mgr) return;
+    const mgr = s.players.find(p => p.id === socket.id && p.isManager); if (!mgr) return;
+
     s.game.setterPointer += 1;
     if (maybeGameOver(s)) return;
     startWaitingForPhrase(s);
   });
 
+  // Setter submits phrase
   socket.on("setter:submitPhrase", ({ phrase, hint }) => {
     const code = socket.data.code; const s = sessions.get(code);
     if (!s || !s.game || s.game.state !== "waiting_phrase") return;
@@ -242,6 +252,7 @@ io.on("connection", (socket) => {
     socket.emit("setter:ok");
   });
 
+  // Setter shows hint
   socket.on("setter:showHint", () => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
     const r = s.game.round; if (socket.id !== r.setterId) return;
@@ -252,6 +263,7 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Guess a letter
   socket.on("player:guessLetter", ({ letter }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
     const r = s.game.round;
@@ -270,7 +282,7 @@ io.on("connection", (socket) => {
       r.winnerId = meId;
       const pts = r.hintShown ? 1 : 2;
       const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
-      emitSessionPlayers(code); // push updated scores immediately
+      emitSessionPlayers(code); // ensure scores update everywhere
       emitGameState(code);
       return;
     }
@@ -279,6 +291,7 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
+  // Attempt full solve
   socket.on("player:solve", ({ guess }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
     const r = s.game.round;
@@ -292,7 +305,7 @@ io.on("connection", (socket) => {
       const pts = r.hintShown ? 1 : 2;
       const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
       r.masked = r.raw;
-      emitSessionPlayers(code); // push updated scores immediately
+      emitSessionPlayers(code); // ensure scores update everywhere
       emitGameState(code);
     } else {
       advanceTurn(s);
@@ -300,11 +313,13 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Disconnect
   socket.on("disconnect", () => {
     const code = socket.data.code;
     if (!code || !sessions.has(code)) return;
     const s = sessions.get(code);
 
+    // ATV disconnect
     if (s.atvSocketId === socket.id) {
       const hasPlayers = s.players.length > 0;
       if (hasPlayers) { s.atvSocketId = null; return; }
@@ -313,6 +328,7 @@ io.on("connection", (socket) => {
       return;
     }
 
+    // Phone disconnect
     const idx = s.players.findIndex(p => p.id === socket.id);
     if (idx !== -1) {
       const wasManager = s.players[idx].isManager;
