@@ -211,6 +211,12 @@ io.on("connection", (socket) => {
     code = String(code || "").trim().toUpperCase();
     const s = getSession(code);
     if (!s) { socket.emit("error:join", { message: "Invalid or expired code." }); return; }
+
+    // NEW: cap at 10
+    if (s.players.length >= 10) {
+      socket.emit("error:join", { message: "Game is full (max 10 players)." });
+      return;
+    }
     const safeName = String(name || "Player").slice(0, 16);
     const isManager = s.players.length === 0;
     s.players.push({ id: socket.id, name: safeName, isManager, score: 0 });
@@ -257,6 +263,12 @@ io.on("connection", (socket) => {
     // Only the manager can start
     const mgr = s.players.find(p => p.id === socket.id && p.isManager);
     if (!mgr) return;
+
+    // NEW: need at least 2 players
+    if (s.players.length < 2) {
+      socket.emit("error:start", { message: "Need at least 2 players to start." });
+      return;
+    }
 
     // Build full setter order = players * rounds (laps)
     s.game = s.game || {};
