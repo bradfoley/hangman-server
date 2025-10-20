@@ -10,13 +10,18 @@ const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+const io = new Server(server, {
+  cors: { origin: "*", methods: ["GET", "POST"] },
+  // Make reconnects less aggressive so we don't flap
+  pingInterval: 25000,
+  pingTimeout: 20000
+});
 
 /** -------------------------
  * Sessions & Game State
  * ------------------------- */
 const sessions = new Map(); // code -> Session
-const CODE_TTL_MS = 1000 * 60 * 60 * 2;
+const CODE_TTL_MS = 1000 * 60 * 60 * 2; // 2 hours
 
 function makeCode(len = 4) {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoid 0,O,1,I
@@ -34,7 +39,7 @@ function createSession(atvSocketId) {
     atvSocketId,
     createdAt: Date.now(),
     players: [], // phones only
-    settings: { rounds: 3, minLen: 3, maxLen: 24 },
+    settings: { rounds: 3, minLen: 3, maxLen: 50 }, // default maxLen bumped to 50
     game: null
   };
   sessions.set(code, s);
@@ -93,7 +98,8 @@ function startNextRound(session) {
 }
 
 function normalizePhrase(input) {
-  const allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ '-.";
+  // allow letters, digits, space and basic punctuation "'-.
+  const allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 '-.";
   const up = String(input || "").toUpperCase().replace(/\s+/g, " ").trim();
   for (const ch of up) if (!allowed.includes(ch)) return null;
   return up;
@@ -188,8 +194,15 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
+  // IMPORTANT: on reconnect, ATV rebinds to an existing session and updates atvSocketId
   socket.on("atv:getPlayers", ({ code }) => {
-    if (!getSession(code)) { socket.emit("session:ended"); return; }
+    code = String(code || "").trim().toUpperCase();
+    const s = getSession(code);
+    if (!s) { socket.emit("session:ended"); return; }
+    socket.join(code);
+    socket.data.code = code;
+    // Rebind the ATV ownership to THIS socket id so old disconnects don't nuke the session
+    s.atvSocketId = socket.id;
     emitSessionPlayers(code);
     emitGameState(code);
   });
@@ -223,7 +236,7 @@ io.on("connection", (socket) => {
     me.name = nn;
 
     // Re-emit players list and (optionally) state for UI that shows names in turn label
-    emitPlayers(code);
+    emitSessionPlayers(code);
     emitGameState(code);
   });
 
@@ -236,73 +249,74 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
+  // New rounds-as-laps start
   socket.on("manager:startGame", () => {
-      const code = socket.data.code;
-      const s = sessions.get(code);
-      if (!s) return;
-    
-      // Only the manager can start
-      const mgr = s.players.find(p => p.id === socket.id && p.isManager);
-      if (!mgr) return;
-    
-      // Build full setter order = players * rounds (laps)
-      s.game = s.game || {};
-      s.game.roundIndex = 0; // backward compat
-      s.game.setterOrder = buildSetterOrder(s);
-      s.game.setterPointer = 0;
-    
-      // If no players, bail
-      if (!s.game.setterOrder.length) {
-        s.game.state = "idle";
-        emitGameState(code);
-        return;
-      }
-    
-      startWaitingForPhrase(s);
-    });
+    const code = socket.data.code;
+    const s = sessions.get(code);
+    if (!s) return;
 
-  // NEW: manager manually advances after a win
+    // Only the manager can start
+    const mgr = s.players.find(p => p.id === socket.id && p.isManager);
+    if (!mgr) return;
+
+    // Build full setter order = players * rounds (laps)
+    s.game = s.game || {};
+    s.game.roundIndex = 0; // backward compat
+    s.game.setterOrder = buildSetterOrder(s);
+    s.game.setterPointer = 0;
+
+    // If no players, bail
+    if (!s.game.setterOrder.length) {
+      s.game.state = "idle";
+      emitGameState(code);
+      return;
+    }
+
+    startWaitingForPhrase(s);
+  });
+
+  // Manager manually advances after a win
   socket.on("manager:nextRound", () => {
     const code = socket.data.code;
     const s = sessions.get(code);
     if (!s || !s.game) return;
-  
+
     // Only manager
     const mgr = s.players.find(p => p.id === socket.id && p.isManager);
     if (!mgr) return;
-  
+
     // Advance to next setter
     s.game.setterPointer += 1;
     if (maybeGameOver(s)) return;
-  
+
     startWaitingForPhrase(s);
   });
 
   socket.on("setter:submitPhrase", ({ phrase, hint }) => {
     const code = socket.data.code; const s = sessions.get(code);
     if (!s || !s.game || s.game.state !== "waiting_phrase") return;
-  
+
     const r = s.game.round;
     if (!r || r.setterId !== socket.id) return; // only current setter
-  
-    // Validate phrase length 3..50, allow letters, digits, spaces and basic punctuation
+
+    // Validate phrase length 3..50
     const raw = String(phrase || "").trim();
     if (raw.length < 3 || raw.length > 50) {
       socket.emit("error:phrase", { message: "Phrase must be 3–50 characters." });
       return;
     }
-  
+
     r.raw = raw;
     r.hint = String(hint || "").slice(0, 120);
     r.hintShown = false;
     r.guessedLetters = []; // reset
-  
+
     // Build masked and guesser order
     r.masked = buildMasked(r.raw, new Set());
     const guessers = s.players.filter(p => p.id !== r.setterId).map(p => p.id);
     r.guesserOrder = guessers;
     r.turnIndex = 0;
-  
+
     s.game.state = "active";
     emitGameState(code);
     socket.emit("setter:ok");
@@ -328,12 +342,12 @@ io.on("connection", (socket) => {
     }
     return order;
   }
-  
+
   function startWaitingForPhrase(s) {
     const code = [...sessions.entries()].find(([c, v]) => v === s)?.[0];
     const sp = s.game.setterPointer;
     const setterId = s.game.setterOrder[sp];
-  
+
     s.game.round = {
       raw: "",
       masked: "",
@@ -341,15 +355,15 @@ io.on("connection", (socket) => {
       hint: "",
       hintShown: false,
       setterId,
-      winnerId: null,
-      // guessers/turns are built after phrase submit, as you already do
+      winnerId: null
+      // guessers/turns are built after phrase submit
     };
-  
+
     s.game.state = "waiting_phrase";
-    emitPlayers(code);
+    emitSessionPlayers(code);
     emitGameState(code);
   }
-  
+
   function maybeGameOver(s) {
     const total = s.game.setterOrder.length;
     if (s.game.setterPointer >= total) {
@@ -391,12 +405,12 @@ io.on("connection", (socket) => {
     const meId = socket.id;
     if (meId !== currentTurnPlayerId(s)) return;
     const normGuess = normalizePhrase(guess); if (!normGuess) return;
-    if (normGuess === r.raw) {
+    if (normGuess === r.raw.toUpperCase()) {
       s.game.state = "won";
       r.winnerId = meId;
       const pts = r.hintShown ? 1 : 2;
       const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
-      r.masked = r.raw;
+      r.masked = r.raw.toUpperCase();
       // DO NOT auto-advance; manager will press "Next Puzzle"
       emitGameState(code);
     } else {
@@ -410,12 +424,21 @@ io.on("connection", (socket) => {
     if (!code || !sessions.has(code)) return;
     const s = sessions.get(code);
 
+    // IMPORTANT: only delete the session if THIS socket is still the current ATV owner
     if (s.atvSocketId === socket.id) {
+      // If there are players still connected, keep the session alive and just drop ATV ownership.
+      // The new ATV connection (reconnect) will rebind via atv:getPlayers.
+      const hasPlayers = s.players.length > 0;
+      if (hasPlayers) {
+        s.atvSocketId = null;
+        return;
+      }
       sessions.delete(code);
       io.to(code).emit("session:ended");
       return;
     }
 
+    // Remove phone player if it was one
     const idx = s.players.findIndex(p => p.id === socket.id);
     if (idx !== -1) {
       const wasManager = s.players[idx].isManager;
