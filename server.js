@@ -18,12 +18,12 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const sessions = new Map(); // code -> Session
 const CODE_TTL_MS = 1000 * 60 * 60 * 2;
 
-function makeCode() {
-  const letters = "ABCDEFGHJKMNPQRSTUVWXYZ";
-  const digits = "23456789";
+function makeCode(len = 4) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoid 0,O,1,I
   let code = "";
-  for (let i = 0; i < 4; i++) code += letters[Math.floor(Math.random() * letters.length)];
-  for (let i = 0; i < 2; i++) code += digits[Math.floor(Math.random() * digits.length)];
+  do {
+    code = Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+  } while (sessions.has(code));
   return code;
 }
 
@@ -208,6 +208,25 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
+  // Player can rename themselves (after joining)
+  socket.on("player:rename", ({ name }) => {
+    const code = socket.data.code;
+    const s = sessions.get(code);
+    if (!s) return;
+
+    const nn = String(name || "").trim().slice(0, 24); // keep sane length
+    if (!nn) return;
+
+    const me = s.players.find(p => p.id === socket.id);
+    if (!me) return;
+
+    me.name = nn;
+
+    // Re-emit players list and (optionally) state for UI that shows names in turn label
+    emitPlayers(code);
+    emitGameState(code);
+  });
+
   socket.on("manager:setSettings", ({ rounds, minLen, maxLen }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s) return;
     const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
@@ -218,46 +237,75 @@ io.on("connection", (socket) => {
   });
 
   socket.on("manager:startGame", () => {
-    const code = socket.data.code; const s = sessions.get(code); if (!s) return;
-    const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
-    if (!s.game) s.game = newGame();
-    startNextRound(s);
-    emitSessionPlayers(code);
-    emitGameState(code);
-  });
+      const code = socket.data.code;
+      const s = sessions.get(code);
+      if (!s) return;
+    
+      // Only the manager can start
+      const mgr = s.players.find(p => p.id === socket.id && p.isManager);
+      if (!mgr) return;
+    
+      // Build full setter order = players * rounds (laps)
+      s.game = s.game || {};
+      s.game.roundIndex = 0; // backward compat
+      s.game.setterOrder = buildSetterOrder(s);
+      s.game.setterPointer = 0;
+    
+      // If no players, bail
+      if (!s.game.setterOrder.length) {
+        s.game.state = "idle";
+        emitGameState(code);
+        return;
+      }
+    
+      startWaitingForPhrase(s);
+    });
 
   // NEW: manager manually advances after a win
   socket.on("manager:nextRound", () => {
-    const code = socket.data.code; const s = sessions.get(code); if (!s) return;
-    const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
-    if (!s.game) return;
-    if (s.game.state !== "won") return; // only when a round has been won
-    startNextRound(s);
-    emitSessionPlayers(code);
-    emitGameState(code);
+    const code = socket.data.code;
+    const s = sessions.get(code);
+    if (!s || !s.game) return;
+  
+    // Only manager
+    const mgr = s.players.find(p => p.id === socket.id && p.isManager);
+    if (!mgr) return;
+  
+    // Advance to next setter
+    s.game.setterPointer += 1;
+    if (maybeGameOver(s)) return;
+  
+    startWaitingForPhrase(s);
   });
 
   socket.on("setter:submitPhrase", ({ phrase, hint }) => {
-    const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "waiting_phrase") return;
+    const code = socket.data.code; const s = sessions.get(code);
+    if (!s || !s.game || s.game.state !== "waiting_phrase") return;
+  
     const r = s.game.round;
-    if (socket.id !== r.setterId) return;
-    const norm = normalizePhrase(phrase);
-    if (!norm) { socket.emit("error:phrase", { message: "Invalid characters. Use letters, space, ', -, ." }); return; }
-    const onlyLetters = norm.replace(/[^A-Z]/g, "");
-    if (onlyLetters.length < s.settings.minLen || onlyLetters.length > s.settings.maxLen) {
-      socket.emit("error:phrase", { message: `Length must be ${s.settings.minLen}-${s.settings.maxLen} letters.` });
+    if (!r || r.setterId !== socket.id) return; // only current setter
+  
+    // Validate phrase length 3..50, allow letters, digits, spaces and basic punctuation
+    const raw = String(phrase || "").trim();
+    if (raw.length < 3 || raw.length > 50) {
+      socket.emit("error:phrase", { message: "Phrase must be 3–50 characters." });
       return;
     }
-    r.raw = norm;
-    r.hint = String(hint || "").slice(0, 100);
-    r.guessedLetters = [];
+  
+    r.raw = raw;
+    r.hint = String(hint || "").slice(0, 120);
     r.hintShown = false;
-    r.guesserOrder = s.players.filter(p => p.id !== r.setterId).map(p => p.id);
+    r.guessedLetters = []; // reset
+  
+    // Build masked and guesser order
+    r.masked = buildMasked(r.raw, new Set());
+    const guessers = s.players.filter(p => p.id !== r.setterId).map(p => p.id);
+    r.guesserOrder = guessers;
     r.turnIndex = 0;
-    r.masked = buildMasked(r.raw, new Set(r.guessedLetters));
+  
     s.game.state = "active";
-    socket.emit("setter:ok", { ok: true });
     emitGameState(code);
+    socket.emit("setter:ok");
   });
 
   socket.on("setter:showHint", () => {
@@ -269,6 +317,50 @@ io.on("connection", (socket) => {
       emitGameState(code);
     }
   });
+
+  function buildSetterOrder(s) {
+    // snapshot the player IDs in join order at start
+    const ids = s.players.map(p => p.id);
+    const laps = Math.max(1, parseInt(s.settings.rounds || 1, 10));
+    const order = [];
+    for (let r = 0; r < laps; r++) {
+      order.push(...ids);
+    }
+    return order;
+  }
+  
+  function startWaitingForPhrase(s) {
+    const code = [...sessions.entries()].find(([c, v]) => v === s)?.[0];
+    const sp = s.game.setterPointer;
+    const setterId = s.game.setterOrder[sp];
+  
+    s.game.round = {
+      raw: "",
+      masked: "",
+      guessedLetters: [],
+      hint: "",
+      hintShown: false,
+      setterId,
+      winnerId: null,
+      // guessers/turns are built after phrase submit, as you already do
+    };
+  
+    s.game.state = "waiting_phrase";
+    emitPlayers(code);
+    emitGameState(code);
+  }
+  
+  function maybeGameOver(s) {
+    const total = s.game.setterOrder.length;
+    if (s.game.setterPointer >= total) {
+      s.game.state = "over";
+      s.game.round = null;
+      const code = [...sessions.entries()].find(([c, v]) => v === s)?.[0];
+      emitGameState(code);
+      return true;
+    }
+    return false;
+  }
 
   socket.on("player:guessLetter", ({ letter }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
