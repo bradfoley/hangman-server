@@ -109,7 +109,7 @@ function buildMasked(raw, guessedSet) {
   let out = "";
   for (const ch of raw) {
     if (/[A-Z]/.test(ch)) out += guessedSet.has(ch) ? ch : "_";
-    else out += ch;
+    else out += ch; // show digits, spaces, punctuation
   }
   return out;
 }
@@ -235,7 +235,6 @@ io.on("connection", (socket) => {
 
     me.name = nn;
 
-    // Re-emit players list and (optionally) state for UI that shows names in turn label
     emitSessionPlayers(code);
     emitGameState(code);
   });
@@ -299,14 +298,19 @@ io.on("connection", (socket) => {
     const r = s.game.round;
     if (!r || r.setterId !== socket.id) return; // only current setter
 
-    // Validate phrase length 3..50
-    const raw = String(phrase || "").trim();
-    if (raw.length < 3 || raw.length > 50) {
+    // Normalize to UPPERCASE so masking hides all letters (fixes “only first letter hidden”)
+    const rawInput = String(phrase || "").trim();
+    if (rawInput.length < 3 || rawInput.length > 50) {
       socket.emit("error:phrase", { message: "Phrase must be 3–50 characters." });
       return;
     }
+    const norm = normalizePhrase(rawInput);
+    if (!norm) {
+      socket.emit("error:phrase", { message: "Only letters, numbers, spaces, apostrophes, dashes, and periods are allowed." });
+      return;
+    }
 
-    r.raw = raw;
+    r.raw = norm; // UPPERCASE canonical
     r.hint = String(hint || "").slice(0, 120);
     r.hintShown = false;
     r.guessedLetters = []; // reset
@@ -405,12 +409,12 @@ io.on("connection", (socket) => {
     const meId = socket.id;
     if (meId !== currentTurnPlayerId(s)) return;
     const normGuess = normalizePhrase(guess); if (!normGuess) return;
-    if (normGuess === r.raw.toUpperCase()) {
+    if (normGuess === r.raw) {
       s.game.state = "won";
       r.winnerId = meId;
       const pts = r.hintShown ? 1 : 2;
       const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
-      r.masked = r.raw.toUpperCase();
+      r.masked = r.raw;
       // DO NOT auto-advance; manager will press "Next Puzzle"
       emitGameState(code);
     } else {
