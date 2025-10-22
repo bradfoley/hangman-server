@@ -1,6 +1,5 @@
-// Hangman server — stable baseline (full)
-// Features: 4-char codes, players ≤10, ≥2 to start, rounds-as-laps, rename, hint, scoring
-// Settings now LOCK once the game has started (Step 3 change only)
+// Hangman server — sessions + rounds + guesses + hint + scoring + wrong-guess limit + debug + verbose logs
+// CommonJS (Render-friendly)
 
 const express = require("express");
 const http = require("http");
@@ -11,15 +10,13 @@ const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
-// ----------------------------
-// Sessions & helpers
-// ----------------------------
-const sessions = new Map(); // code -> session
-const CODE_TTL_MS = 1000 * 60 * 60 * 2; // 2h
+/** -------------------------
+ * Sessions & Game State
+ * ------------------------- */
+const sessions = new Map(); // code -> Session
+const CODE_TTL_MS = 1000 * 60 * 60 * 2;
 
 function makeCode(len = 4) {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoid 0,O,1,I
@@ -31,16 +28,22 @@ function makeCode(len = 4) {
 }
 
 function createSession(atvSocketId) {
-  const code = makeCode(4);
+  let code;
+  do { code = makeCode(); } while (sessions.has(code));
   const s = {
     atvSocketId,
     createdAt: Date.now(),
-    players: [],
-    settings: { rounds: 3, minLen: 3, maxLen: 50 },
+    players: [], // phones only
+    settings: { 
+      rounds: 1,               // each player sets once per "round"
+      minLen: 3, 
+      maxLen: 50,
+      wrongLimit: 6,           // number of wrong guesses allowed
+      unlimitedWrong: false    // if true -> ignore wrongLimit
+    },
     game: null
   };
   sessions.set(code, s);
-  console.log(`🆕 Session created code=${code} (atv=${atvSocketId})`);
   return code;
 }
 
@@ -51,8 +54,63 @@ function getSession(code) {
   return s;
 }
 
+function newGame() {
+  return {
+    roundIndex: -1,
+    setterIndex: -1,       // rotates across PHONE players
+    state: "idle",         // idle | waiting_phrase | active | won | over
+    round: null,
+    setterOrder: [],
+    setterPointer: 0
+  };
+}
+
+function buildSetterOrder(s) {
+  // snapshot player IDs in join order at start
+  const ids = s.players.map(p => p.id);
+  const laps = Math.max(1, parseInt(s.settings.rounds || 1, 10));
+  const order = [];
+  for (let r = 0; r < laps; r++) order.push(...ids);
+  return order;
+}
+
+function startWaitingForPhrase(s) {
+  const code = [...sessions.entries()].find(([c, v]) => v === s)?.[0];
+  const sp = s.game.setterPointer;
+  const setterId = s.game.setterOrder[sp];
+
+  s.game.round = {
+    raw: "",
+    masked: "",
+    guessedLetters: [],
+    hint: "",
+    hintShown: false,
+    setterId,
+    winnerId: null,
+    wrongCount: 0, // NEW — wrong guesses in this round
+    guesserOrder: [],
+    turnIndex: 0
+  };
+
+  s.game.state = "waiting_phrase";
+  emitSessionPlayers(code);
+  emitGameState(code);
+}
+
+function maybeGameOver(s) {
+  const total = s.game.setterOrder.length;
+  if (s.game.setterPointer >= total) {
+    s.game.state = "over";
+    s.game.round = null;
+    const code = [...sessions.entries()].find(([c, v]) => v === s)?.[0];
+    emitGameState(code);
+    return true;
+  }
+  return false;
+}
+
 function normalizePhrase(input) {
-  const allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 '-.";
+  const allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ '-.";
   const up = String(input || "").toUpperCase().replace(/\s+/g, " ").trim();
   for (const ch of up) if (!allowed.includes(ch)) return null;
   return up;
@@ -61,8 +119,8 @@ function normalizePhrase(input) {
 function buildMasked(raw, guessedSet) {
   let out = "";
   for (const ch of raw) {
-    if (/[A-Z]/.test(ch)) out += guessedSet.has(ch) ? ch : "_";
-    else out += ch; // show digits/space/punct
+    if (/[A-Za-z]/.test(ch)) out += guessedSet.has(ch.toUpperCase()) ? ch.toUpperCase() : "_";
+    else out += ch;
   }
   return out;
 }
@@ -90,38 +148,43 @@ function emitSessionPlayers(code) {
 function emitGameState(code) {
   const s = sessions.get(code); if (!s) return;
   const g = s.game;
-  const currentTurnId = (g && g.state === "active") ? currentTurnPlayerId(s) : null;
+  const currentTurnId = s.game && s.game.state === "active" ? currentTurnPlayerId(s) : null;
   io.to(code).emit("game:state", {
     state: g?.state ?? "idle",
     roundsTotal: s.settings.rounds,
-    roundIndex: g?.roundIndex ?? -1,
+    roundIndex: g?.setterPointer ?? -1, // for "Puzzle X/Y"
     setterId: g?.round?.setterId ?? null,
     currentTurnId,
     hintShown: g?.round?.hintShown ?? false,
     masked: g?.round?.masked ?? "",
     guessedLetters: g?.round?.guessedLetters ?? [],
     winnerId: g?.round?.winnerId ?? null,
+    wrongLimit: s.settings.unlimitedWrong ? null : (s.settings.wrongLimit ?? 6),
+    wrongCount: g?.round?.wrongCount ?? 0,
     scores: s.players.map(p => ({ id: p.id, score: p.score ?? 0 }))
   });
 }
 
-// ----------------------------
-// HTTP debug
-// ----------------------------
-app.get("/", (_req, res) => res.send("✅ Hangman server up"));
+/** -------------------------
+ * HTTP debug helpers
+ * ------------------------- */
+app.get("/", (_req, res) => res.send("✅ Hangman server running — sessions & rounds & wrong-limit ready."));
 app.get("/debug/reset", (_req, res) => { sessions.clear(); res.json({ ok: true }); });
 app.get("/debug/create", (_req, res) => {
-  const code = createSession("HTTP_DEBUG");
+  const fakeAtvId = "HTTP_DEBUG_ATV_" + Math.random().toString(36).slice(2, 8);
+  const code = createSession(fakeAtvId);
   res.json({ code });
 });
 
-// ----------------------------
-// Socket.IO
-// ----------------------------
+/** -------------------------
+ * Socket events
+ * ------------------------- */
 io.on("connection", (socket) => {
   socket.data.code = null;
+  socket.onAny((event, payload) => {
+    console.log(`📨 ${socket.id} -> ${event}`, payload || "");
+  });
 
-  // ATV creates new session
   socket.on("atv:createSession", () => {
     const code = createSession(socket.id);
     socket.join(code);
@@ -131,30 +194,21 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
-  // ATV reconnects to existing session
   socket.on("atv:getPlayers", ({ code }) => {
-    code = String(code || "").trim().toUpperCase();
-    const s = getSession(code);
-    if (!s) { socket.emit("session:ended"); return; }
+    if (!getSession(code)) { socket.emit("session:ended"); return; }
     socket.join(code);
     socket.data.code = code;
-    s.atvSocketId = socket.id;            // rebind ATV ownership
-    socket.emit("session:created", { code }); // always re-send code
     emitSessionPlayers(code);
     emitGameState(code);
   });
 
-  // Phone joins
   socket.on("player:join", ({ code, name }) => {
     code = String(code || "").trim().toUpperCase();
     const s = getSession(code);
     if (!s) { socket.emit("error:join", { message: "Invalid or expired code." }); return; }
-    if (s.players.length >= 10) { socket.emit("error:join", { message: "Game is full (max 10 players)." }); return; }
-
     const safeName = String(name || "Player").slice(0, 16);
     const isManager = s.players.length === 0;
     s.players.push({ id: socket.id, name: safeName, isManager, score: 0 });
-
     socket.join(code);
     socket.data.code = code;
     socket.emit("player:joined", { code, isManager });
@@ -165,59 +219,60 @@ io.on("connection", (socket) => {
   socket.on("player:rejoin", ({ code, name }) => {
     code = String(code || "").trim().toUpperCase();
     const s = getSession(code);
-    if (!s) return; // invalid/expired
-    const safeName = String(name || "Player").slice(0, 16);
-  
-    // If someone with that name already exists, reuse that slot
-    let existing = s.players.find(p => p.name === safeName);
-    if (existing) {
-      existing.id = socket.id;
+    if (!s) { socket.emit("error:join", { message: "Invalid or expired code." }); return; }
+    // if already present, just rename; otherwise add
+    let p = s.players.find(p => p.id === socket.id);
+    if (!p) {
+      const isManager = s.players.length === 0;
+      p = { id: socket.id, name: String(name || "Player").slice(0, 16), isManager, score: 0 };
+      s.players.push(p);
     } else {
-      s.players.push({ id: socket.id, name: safeName, isManager: false, score: 0 });
+      p.name = String(name || p.name).slice(0, 16);
     }
-  
     socket.join(code);
     socket.data.code = code;
-    socket.emit("player:joined", { code, isManager: existing?.isManager ?? false });
+    socket.emit("player:joined", { code, isManager: p.isManager });
     emitSessionPlayers(code);
     emitGameState(code);
   });
 
-  // Rename
+  // Player can rename themselves (after joining)
   socket.on("player:rename", ({ name }) => {
     const code = socket.data.code;
-    const s = sessions.get(code); if (!s) return;
-    const me = s.players.find(p => p.id === socket.id); if (!me) return;
-    const nn = String(name || "").trim().slice(0, 24); if (!nn) return;
+    const s = sessions.get(code);
+    if (!s) return;
+    const nn = String(name || "").trim().slice(0, 24);
+    if (!nn) return;
+    const me = s.players.find(p => p.id === socket.id);
+    if (!me) return;
     me.name = nn;
     emitSessionPlayers(code);
     emitGameState(code);
   });
 
-  // Manager sets settings
-  socket.on("manager:setSettings", ({ rounds, minLen, maxLen }) => {
+  // Settings — now includes wrongLimit & unlimitedWrong
+  socket.on("manager:setSettings", ({ rounds, minLen, maxLen, wrongLimit, unlimitedWrong }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s) return;
     const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
-
-    // ✅ Step 3: LOCK settings once game is not idle
-    if (s.game && s.game.state && s.game.state !== "idle") {
-      return; // ignore changes after start
-    }
-
     if (Number.isInteger(rounds) && rounds >= 1 && rounds <= 20) s.settings.rounds = rounds;
     if (Number.isInteger(minLen) && minLen >= 1 && minLen <= 40) s.settings.minLen = minLen;
     if (Number.isInteger(maxLen) && maxLen >= s.settings.minLen && maxLen <= 60) s.settings.maxLen = maxLen;
+    if (typeof unlimitedWrong === "boolean") s.settings.unlimitedWrong = unlimitedWrong;
+    if (!s.settings.unlimitedWrong && Number.isInteger(wrongLimit)) {
+      s.settings.wrongLimit = Math.max(1, Math.min(26, wrongLimit));
+    }
     emitGameState(code);
   });
 
-  // Manager starts game (rounds-as-laps)
   socket.on("manager:startGame", () => {
-    const code = socket.data.code; const s = sessions.get(code); if (!s) return;
-    const mgr = s.players.find(p => p.id === socket.id && p.isManager); if (!mgr) return;
-    if (s.players.length < 2) { socket.emit("error:start", { message: "Need at least 2 players to start." }); return; }
+    const code = socket.data.code;
+    const s = sessions.get(code);
+    if (!s) return;
+
+    const mgr = s.players.find(p => p.id === socket.id && p.isManager);
+    if (!mgr) return;
 
     s.game = s.game || {};
-    s.game.roundIndex = 0;
     s.game.setterOrder = buildSetterOrder(s);
     s.game.setterPointer = 0;
 
@@ -226,42 +281,65 @@ io.on("connection", (socket) => {
       emitGameState(code);
       return;
     }
+
     startWaitingForPhrase(s);
   });
 
-  // Manager advances after a win
+  // manager manually advances after win
   socket.on("manager:nextRound", () => {
-    const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game) return;
-    const mgr = s.players.find(p => p.id === socket.id && p.isManager); if (!mgr) return;
+    const code = socket.data.code;
+    const s = sessions.get(code);
+    if (!s || !s.game) return;
+    const mgr = s.players.find(p => p.id === socket.id && p.isManager);
+    if (!mgr) return;
 
     s.game.setterPointer += 1;
     if (maybeGameOver(s)) return;
     startWaitingForPhrase(s);
   });
 
-  // Setter submits phrase
+  // End game & new code for ATV
+  socket.on("manager:endGame", () => {
+    const code = socket.data.code;
+    const s = sessions.get(code);
+    if (!s) return;
+    const mgr = s.players.find(p => p.id === socket.id && p.isManager);
+    if (!mgr) return;
+
+    const atvId = s.atvSocketId;
+    io.to(code).emit("session:ended");
+    sessions.delete(code);
+
+    const atvSock = io.sockets.sockets.get(atvId);
+    if (atvSock) {
+      const newCode = createSession(atvId);
+      try { atvSock.leave(code); } catch {}
+      atvSock.join(newCode);
+      atvSock.data.code = newCode;
+      atvSock.emit("session:created", { code: newCode });
+      emitSessionPlayers(newCode);
+      emitGameState(newCode);
+    }
+  });
+
   socket.on("setter:submitPhrase", ({ phrase, hint }) => {
     const code = socket.data.code; const s = sessions.get(code);
     if (!s || !s.game || s.game.state !== "waiting_phrase") return;
 
     const r = s.game.round;
-    if (!r || r.setterId !== socket.id) return;
+    if (!r || r.setterId !== socket.id) return; // only current setter
 
-    const rawInput = String(phrase || "").trim();
-    if (rawInput.length < 3 || rawInput.length > 50) {
-      socket.emit("error:phrase", { message: "Phrase must be 3–50 characters." });
-      return;
-    }
-    const norm = normalizePhrase(rawInput);
-    if (!norm) {
-      socket.emit("error:phrase", { message: "Only letters, numbers, spaces, apostrophes, dashes, and periods are allowed." });
+    const raw = String(phrase || "").trim();
+    if (raw.length < s.settings.minLen || raw.length > s.settings.maxLen) {
+      socket.emit("error:phrase", { message: `Phrase must be ${s.settings.minLen}–${s.settings.maxLen} characters.` });
       return;
     }
 
-    r.raw = norm;
+    r.raw = raw.toUpperCase();
     r.hint = String(hint || "").slice(0, 120);
     r.hintShown = false;
     r.guessedLetters = [];
+    r.wrongCount = 0;
 
     r.masked = buildMasked(r.raw, new Set());
     const guessers = s.players.filter(p => p.id !== r.setterId).map(p => p.id);
@@ -273,7 +351,6 @@ io.on("connection", (socket) => {
     socket.emit("setter:ok");
   });
 
-  // Setter shows hint
   socket.on("setter:showHint", () => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
     const r = s.game.round; if (socket.id !== r.setterId) return;
@@ -284,103 +361,97 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Guess a letter
+  function finishRoundWithSetterWin(s, code) {
+    const r = s.game.round;
+    s.game.state = "won";
+    r.winnerId = r.setterId;
+    // Points to setter: 1 if hint not shown, 2 if hint shown (as requested)
+    const pts = r.hintShown ? 2 : 1;
+    const setter = s.players.find(p => p.id === r.setterId);
+    if (setter) setter.score = (setter.score || 0) + pts;
+    emitGameState(code);
+  }
+
   socket.on("player:guessLetter", ({ letter }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
     const r = s.game.round;
     const meId = socket.id;
     if (meId !== currentTurnPlayerId(s)) return;
-
     const L = String(letter || "").toUpperCase();
     if (!/^[A-Z]$/.test(L)) return;
     if (r.guessedLetters.includes(L)) return;
 
     r.guessedLetters.push(L);
-    r.masked = buildMasked(r.raw, new Set(r.guessedLetters));
 
-    if (!r.masked.includes("_")) {
-      s.game.state = "won";
-      r.winnerId = meId;
-      const pts = r.hintShown ? 1 : 2;
-      const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
-      emitSessionPlayers(code); // ensure scores update everywhere
+    if (r.raw.includes(L)) {
+      // correct guess
+      r.masked = buildMasked(r.raw, new Set(r.guessedLetters));
+      if (!r.masked.includes("_")) {
+        s.game.state = "won";
+        r.winnerId = meId;
+        const pts = r.hintShown ? 1 : 2; // solver: 2 without hint, 1 with hint
+        const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
+        emitGameState(code);
+        return;
+      }
+      // correct but not solved -> advance turn
+      advanceTurn(s);
       emitGameState(code);
-      return;
+    } else {
+      // wrong letter -> increment wrongCount and check limit
+      r.wrongCount = (r.wrongCount || 0) + 1;
+      const limited = !s.settings.unlimitedWrong;
+      const limit = s.settings.wrongLimit ?? 6;
+      if (limited && r.wrongCount >= limit) {
+        // round ends; setter gets points
+        finishRoundWithSetterWin(s, code);
+        return;
+      }
+      // continue to next turn
+      advanceTurn(s);
+      emitGameState(code);
     }
-
-    advanceTurn(s);
-    emitGameState(code);
   });
 
-  // Attempt full solve
   socket.on("player:solve", ({ guess }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s || !s.game || s.game.state !== "active") return;
     const r = s.game.round;
     const meId = socket.id;
     if (meId !== currentTurnPlayerId(s)) return;
-
     const normGuess = normalizePhrase(guess); if (!normGuess) return;
+
     if (normGuess === r.raw) {
       s.game.state = "won";
       r.winnerId = meId;
       const pts = r.hintShown ? 1 : 2;
       const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
       r.masked = r.raw;
-      emitSessionPlayers(code); // ensure scores update everywhere
       emitGameState(code);
     } else {
+      // wrong solve attempt counts as a wrong guess
+      r.wrongCount = (r.wrongCount || 0) + 1;
+      const limited = !s.settings.unlimitedWrong;
+      const limit = s.settings.wrongLimit ?? 6;
+      if (limited && r.wrongCount >= limit) {
+        finishRoundWithSetterWin(s, code);
+        return;
+      }
       advanceTurn(s);
       emitGameState(code);
     }
   });
 
-  // Manager can end the game and reset (new code on the ATV)
-  socket.on("manager:endGame", () => {
-    const code = socket.data.code;
-    const s = sessions.get(code);
-    if (!s) return;
-
-    // Only allow the current manager to end
-    const mgr = s.players.find(p => p.id === socket.id && p.isManager);
-    if (!mgr) return;
-
-    const atvId = s.atvSocketId;
-
-    // Notify and tear down old session
-    io.to(code).emit("session:ended");
-    sessions.delete(code);
-
-    // Move the ATV socket into a brand-new session with a fresh code
-    const atvSock = io.sockets.sockets.get(atvId);
-    if (atvSock) {
-      const newCode = createSession(atvId);
-      try { atvSock.leave(code); } catch {}
-      atvSock.join(newCode);
-      atvSock.data.code = newCode;
-
-      // Tell ATV its new code and broadcast initial state
-      atvSock.emit("session:created", { code: newCode });
-      emitSessionPlayers(newCode);
-      emitGameState(newCode);
-    }
-  });
-
-  // Disconnect
   socket.on("disconnect", () => {
     const code = socket.data.code;
     if (!code || !sessions.has(code)) return;
     const s = sessions.get(code);
 
-    // ATV disconnect
     if (s.atvSocketId === socket.id) {
-      const hasPlayers = s.players.length > 0;
-      if (hasPlayers) { s.atvSocketId = null; return; }
       sessions.delete(code);
       io.to(code).emit("session:ended");
       return;
     }
 
-    // Phone disconnect
     const idx = s.players.findIndex(p => p.id === socket.id);
     if (idx !== -1) {
       const wasManager = s.players[idx].isManager;
@@ -393,62 +464,15 @@ io.on("connection", (socket) => {
         const gidx = s.game.round.guesserOrder.indexOf(removedId);
         if (gidx !== -1) s.game.round.guesserOrder.splice(gidx, 1);
         if (s.game.round.guesserOrder.length === 0 && s.game.state === "active") {
-          s.game.state = "won";
-          s.game.round.winnerId = null;
+          // no guessers left — treat as setter win
+          finishRoundWithSetterWin(s, code);
         }
       }
     }
-
     emitSessionPlayers(code);
     emitGameState(code);
   });
 });
 
-// ----------------------------
-// Round helpers
-// ----------------------------
-function buildSetterOrder(s) {
-  const ids = s.players.map(p => p.id);
-  const laps = Math.max(1, parseInt(s.settings.rounds || 1, 10));
-  const order = [];
-  for (let r = 0; r < laps; r++) order.push(...ids);
-  return order;
-}
-
-function startWaitingForPhrase(s) {
-  const code = [...sessions.entries()].find(([c, v]) => v === s)?.[0];
-  const sp = s.game.setterPointer;
-  const setterId = s.game.setterOrder[sp];
-
-  s.game.round = {
-    raw: "",
-    masked: "",
-    guessedLetters: [],
-    hint: "",
-    hintShown: false,
-    setterId,
-    winnerId: null
-  };
-
-  s.game.state = "waiting_phrase";
-  emitSessionPlayers(code);
-  emitGameState(code);
-}
-
-function maybeGameOver(s) {
-  const total = s.game.setterOrder.length;
-  if (s.game.setterPointer >= total) {
-    s.game.state = "over";
-    s.game.round = null;
-    const code = [...sessions.entries()].find(([c, v]) => v === s)?.[0];
-    emitGameState(code);
-    return true;
-  }
-  return false;
-}
-
-// ----------------------------
-// Start server
-// ----------------------------
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
