@@ -162,6 +162,27 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
+  socket.on("player:rejoin", ({ code, name }) => {
+    code = String(code || "").trim().toUpperCase();
+    const s = getSession(code);
+    if (!s) return; // invalid/expired
+    const safeName = String(name || "Player").slice(0, 16);
+  
+    // If someone with that name already exists, reuse that slot
+    let existing = s.players.find(p => p.name === safeName);
+    if (existing) {
+      existing.id = socket.id;
+    } else {
+      s.players.push({ id: socket.id, name: safeName, isManager: false, score: 0 });
+    }
+  
+    socket.join(code);
+    socket.data.code = code;
+    socket.emit("player:joined", { code, isManager: existing?.isManager ?? false });
+    emitSessionPlayers(code);
+    emitGameState(code);
+  });
+
   // Rename
   socket.on("player:rename", ({ name }) => {
     const code = socket.data.code;
