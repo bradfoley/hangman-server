@@ -35,7 +35,7 @@ function createSession(atvSocketId) {
     createdAt: Date.now(),
     players: [], // phones only
     settings: { 
-      rounds: 1,               // each player sets once per "round"
+      rounds: 3,               // 🔸 default rounds = 3 (was 1)
       minLen: 3, 
       maxLen: 50,
       wrongLimit: 6,           // number of wrong guesses allowed
@@ -87,7 +87,7 @@ function startWaitingForPhrase(s) {
     hintShown: false,
     setterId,
     winnerId: null,
-    wrongCount: 0, // NEW — wrong guesses in this round
+    wrongCount: 0, // wrong guesses in this round
     guesserOrder: [],
     turnIndex: 0
   };
@@ -151,8 +151,8 @@ function emitGameState(code) {
   const currentTurnId = s.game && s.game.state === "active" ? currentTurnPlayerId(s) : null;
   io.to(code).emit("game:state", {
     state: g?.state ?? "idle",
-    roundsTotal: s.settings.rounds,
-    roundIndex: g?.setterPointer ?? -1, // for "Puzzle X/Y"
+    roundsTotal: s.settings.rounds,              // for Puzzle X/Y
+    roundIndex: g?.setterPointer ?? -1,          // 0-based index of current puzzle
     setterId: g?.round?.setterId ?? null,
     currentTurnId,
     hintShown: g?.round?.hintShown ?? false,
@@ -220,7 +220,6 @@ io.on("connection", (socket) => {
     code = String(code || "").trim().toUpperCase();
     const s = getSession(code);
     if (!s) { socket.emit("error:join", { message: "Invalid or expired code." }); return; }
-    // if already present, just rename; otherwise add
     let p = s.players.find(p => p.id === socket.id);
     if (!p) {
       const isManager = s.players.length === 0;
@@ -236,7 +235,6 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
-  // Player can rename themselves (after joining)
   socket.on("player:rename", ({ name }) => {
     const code = socket.data.code;
     const s = sessions.get(code);
@@ -250,7 +248,7 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
-  // Settings — now includes wrongLimit & unlimitedWrong
+  // Settings — rounds now default to 3; plus wrongLimit & unlimitedWrong supported
   socket.on("manager:setSettings", ({ rounds, minLen, maxLen, wrongLimit, unlimitedWrong }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s) return;
     const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
@@ -285,7 +283,6 @@ io.on("connection", (socket) => {
     startWaitingForPhrase(s);
   });
 
-  // manager manually advances after win
   socket.on("manager:nextRound", () => {
     const code = socket.data.code;
     const s = sessions.get(code);
@@ -298,7 +295,6 @@ io.on("connection", (socket) => {
     startWaitingForPhrase(s);
   });
 
-  // End game & new code for ATV
   socket.on("manager:endGame", () => {
     const code = socket.data.code;
     const s = sessions.get(code);
@@ -327,7 +323,7 @@ io.on("connection", (socket) => {
     if (!s || !s.game || s.game.state !== "waiting_phrase") return;
 
     const r = s.game.round;
-    if (!r || r.setterId !== socket.id) return; // only current setter
+    if (!r || r.setterId !== socket.id) return;
 
     const raw = String(phrase || "").trim();
     if (raw.length < s.settings.minLen || raw.length > s.settings.maxLen) {
@@ -365,7 +361,7 @@ io.on("connection", (socket) => {
     const r = s.game.round;
     s.game.state = "won";
     r.winnerId = r.setterId;
-    // Points to setter: 1 if hint not shown, 2 if hint shown (as requested)
+    // Points to setter: 1 if hint not shown, 2 if hint shown
     const pts = r.hintShown ? 2 : 1;
     const setter = s.players.find(p => p.id === r.setterId);
     if (setter) setter.score = (setter.score || 0) + pts;
@@ -384,7 +380,6 @@ io.on("connection", (socket) => {
     r.guessedLetters.push(L);
 
     if (r.raw.includes(L)) {
-      // correct guess
       r.masked = buildMasked(r.raw, new Set(r.guessedLetters));
       if (!r.masked.includes("_")) {
         s.game.state = "won";
@@ -394,20 +389,16 @@ io.on("connection", (socket) => {
         emitGameState(code);
         return;
       }
-      // correct but not solved -> advance turn
       advanceTurn(s);
       emitGameState(code);
     } else {
-      // wrong letter -> increment wrongCount and check limit
       r.wrongCount = (r.wrongCount || 0) + 1;
       const limited = !s.settings.unlimitedWrong;
       const limit = s.settings.wrongLimit ?? 6;
       if (limited && r.wrongCount >= limit) {
-        // round ends; setter gets points
         finishRoundWithSetterWin(s, code);
         return;
       }
-      // continue to next turn
       advanceTurn(s);
       emitGameState(code);
     }
@@ -428,7 +419,6 @@ io.on("connection", (socket) => {
       r.masked = r.raw;
       emitGameState(code);
     } else {
-      // wrong solve attempt counts as a wrong guess
       r.wrongCount = (r.wrongCount || 0) + 1;
       const limited = !s.settings.unlimitedWrong;
       const limit = s.settings.wrongLimit ?? 6;
@@ -464,7 +454,6 @@ io.on("connection", (socket) => {
         const gidx = s.game.round.guesserOrder.indexOf(removedId);
         if (gidx !== -1) s.game.round.guesserOrder.splice(gidx, 1);
         if (s.game.round.guesserOrder.length === 0 && s.game.state === "active") {
-          // no guessers left — treat as setter win
           finishRoundWithSetterWin(s, code);
         }
       }
