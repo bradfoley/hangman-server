@@ -361,10 +361,15 @@ io.on("connection", (socket) => {
     const r = s.game.round;
     s.game.state = "won";
     r.winnerId = r.setterId;
+  
+    // ▶ Make the ATV show the full solution when guessers fail
+    r.masked = r.raw;
+  
     // Points to setter: 1 if hint not shown, 2 if hint shown
     const pts = r.hintShown ? 2 : 1;
     const setter = s.players.find(p => p.id === r.setterId);
     if (setter) setter.score = (setter.score || 0) + pts;
+  
     emitGameState(code);
   }
 
