@@ -1,4 +1,4 @@
-// Hangman server — sessions + rounds + guesses + hint + scoring + wrong-guess limit + debug + verbose logs
+// Hangman server — sessions + rounds + guesses + hint + scoring + wrong-guess limit + robust rejoin + debug
 // CommonJS (Render-friendly)
 
 const express = require("express");
@@ -35,11 +35,11 @@ function createSession(atvSocketId) {
     createdAt: Date.now(),
     players: [], // phones only
     settings: { 
-      rounds: 3,               // 🔸 default rounds = 3 (was 1)
+      rounds: 3,
       minLen: 3, 
       maxLen: 50,
-      wrongLimit: 6,           // number of wrong guesses allowed
-      unlimitedWrong: false    // if true -> ignore wrongLimit
+      wrongLimit: 6,
+      unlimitedWrong: false
     },
     game: null
   };
@@ -56,17 +56,14 @@ function getSession(code) {
 
 function newGame() {
   return {
-    roundIndex: -1,
-    setterIndex: -1,       // rotates across PHONE players
-    state: "idle",         // idle | waiting_phrase | active | won | over
+    state: "idle",          // idle | waiting_phrase | active | won | over
     round: null,
     setterOrder: [],
-    setterPointer: 0
+    setterPointer: 0        // 0..setterOrder.length-1
   };
 }
 
 function buildSetterOrder(s) {
-  // snapshot player IDs in join order at start
   const ids = s.players.map(p => p.id);
   const laps = Math.max(1, parseInt(s.settings.rounds || 1, 10));
   const order = [];
@@ -87,7 +84,7 @@ function startWaitingForPhrase(s) {
     hintShown: false,
     setterId,
     winnerId: null,
-    wrongCount: 0, // wrong guesses in this round
+    wrongCount: 0,
     guesserOrder: [],
     turnIndex: 0
   };
@@ -151,8 +148,8 @@ function emitGameState(code) {
   const currentTurnId = s.game && s.game.state === "active" ? currentTurnPlayerId(s) : null;
   io.to(code).emit("game:state", {
     state: g?.state ?? "idle",
-    roundsTotal: s.settings.rounds,              // for Puzzle X/Y
-    roundIndex: g?.setterPointer ?? -1,          // 0-based index of current puzzle
+    roundsTotal: s.settings.rounds,              
+    roundIndex: g?.setterPointer ?? -1,          
     setterId: g?.round?.setterId ?? null,
     currentTurnId,
     hintShown: g?.round?.hintShown ?? false,
@@ -170,11 +167,6 @@ function emitGameState(code) {
  * ------------------------- */
 app.get("/", (_req, res) => res.send("✅ Hangman server running — sessions & rounds & wrong-limit ready."));
 app.get("/debug/reset", (_req, res) => { sessions.clear(); res.json({ ok: true }); });
-app.get("/debug/create", (_req, res) => {
-  const fakeAtvId = "HTTP_DEBUG_ATV_" + Math.random().toString(36).slice(2, 8);
-  const code = createSession(fakeAtvId);
-  res.json({ code });
-});
 
 /** -------------------------
  * Socket events
@@ -216,18 +208,43 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
-  socket.on("player:rejoin", ({ code, name }) => {
+  // 🔧 Robust rejoin: allow client to pass prevId so we can re-map role/turns/setter
+  socket.on("player:rejoin", ({ code, name, prevId }) => {
     code = String(code || "").trim().toUpperCase();
     const s = getSession(code);
     if (!s) { socket.emit("error:join", { message: "Invalid or expired code." }); return; }
-    let p = s.players.find(p => p.id === socket.id);
+
+    const safeName = String(name || "Player").slice(0, 16);
+
+    let p = null;
+    if (prevId) {
+      p = s.players.find(pp => pp.id === prevId) || null;
+    }
     if (!p) {
+      // fallback: create a new player (e.g., first join after refresh before start)
       const isManager = s.players.length === 0;
-      p = { id: socket.id, name: String(name || "Player").slice(0, 16), isManager, score: 0 };
+      p = { id: socket.id, name: safeName, isManager, score: 0 };
       s.players.push(p);
     } else {
-      p.name = String(name || p.name).slice(0, 16);
+      // rebind id + name
+      const oldId = p.id;
+      p.id = socket.id;
+      p.name = safeName;
+
+      // update any round pointers (setter & guesser order)
+      if (s.game?.round) {
+        const r = s.game.round;
+        if (r.setterId === oldId) r.setterId = socket.id;
+        if (Array.isArray(r.guesserOrder)) {
+          r.guesserOrder = r.guesserOrder.map(x => (x === oldId ? socket.id : x));
+        }
+      }
+      // update setter order for future rounds
+      if (s.game?.setterOrder?.length) {
+        s.game.setterOrder = s.game.setterOrder.map(x => (x === oldId ? socket.id : x));
+      }
     }
+
     socket.join(code);
     socket.data.code = code;
     socket.emit("player:joined", { code, isManager: p.isManager });
@@ -248,7 +265,6 @@ io.on("connection", (socket) => {
     emitGameState(code);
   });
 
-  // Settings — rounds now default to 3; plus wrongLimit & unlimitedWrong supported
   socket.on("manager:setSettings", ({ rounds, minLen, maxLen, wrongLimit, unlimitedWrong }) => {
     const code = socket.data.code; const s = sessions.get(code); if (!s) return;
     const me = s.players.find(p => p.id === socket.id); if (!me?.isManager) return;
@@ -270,7 +286,7 @@ io.on("connection", (socket) => {
     const mgr = s.players.find(p => p.id === socket.id && p.isManager);
     if (!mgr) return;
 
-    s.game = s.game || {};
+    s.game = newGame();
     s.game.setterOrder = buildSetterOrder(s);
     s.game.setterPointer = 0;
 
@@ -361,15 +377,12 @@ io.on("connection", (socket) => {
     const r = s.game.round;
     s.game.state = "won";
     r.winnerId = r.setterId;
-  
-    // ▶ Make the ATV show the full solution when guessers fail
+    // Reveal full phrase when guessers fail
     r.masked = r.raw;
-  
-    // Points to setter: 1 if hint not shown, 2 if hint shown
+    // Points to setter: 1 if hint NOT shown, 2 if hint shown
     const pts = r.hintShown ? 2 : 1;
     const setter = s.players.find(p => p.id === r.setterId);
     if (setter) setter.score = (setter.score || 0) + pts;
-  
     emitGameState(code);
   }
 
@@ -389,7 +402,7 @@ io.on("connection", (socket) => {
       if (!r.masked.includes("_")) {
         s.game.state = "won";
         r.winnerId = meId;
-        const pts = r.hintShown ? 1 : 2; // solver: 2 without hint, 1 with hint
+        const pts = r.hintShown ? 1 : 2;
         const winner = s.players.find(p => p.id === meId); if (winner) winner.score = (winner.score || 0) + pts;
         emitGameState(code);
         return;
