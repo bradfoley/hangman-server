@@ -334,6 +334,37 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Manager can end the game and reset (new code on the ATV)
+  socket.on("manager:endGame", () => {
+    const code = socket.data.code;
+    const s = sessions.get(code);
+    if (!s) return;
+
+    // Only allow the current manager to end
+    const mgr = s.players.find(p => p.id === socket.id && p.isManager);
+    if (!mgr) return;
+
+    const atvId = s.atvSocketId;
+
+    // Notify and tear down old session
+    io.to(code).emit("session:ended");
+    sessions.delete(code);
+
+    // Move the ATV socket into a brand-new session with a fresh code
+    const atvSock = io.sockets.sockets.get(atvId);
+    if (atvSock) {
+      const newCode = createSession(atvId);
+      try { atvSock.leave(code); } catch {}
+      atvSock.join(newCode);
+      atvSock.data.code = newCode;
+
+      // Tell ATV its new code and broadcast initial state
+      atvSock.emit("session:created", { code: newCode });
+      emitSessionPlayers(newCode);
+      emitGameState(newCode);
+    }
+  });
+
   // Disconnect
   socket.on("disconnect", () => {
     const code = socket.data.code;
